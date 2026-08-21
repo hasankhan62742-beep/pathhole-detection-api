@@ -238,7 +238,10 @@
     </div>
     <div class="scan-controls">
       <button class="btn-secondary" id="btnCamera">Start Camera</button>
-      <button class="btn-primary" id="btnCapture" disabled>Scan for Potholes</button>
+      <button class="btn-primary" id="btnCapture" disabled>Scan Once</button>
+    </div>
+    <div class="scan-controls" style="padding-top:0;">
+      <button class="btn-secondary" id="btnAuto" disabled>Start Live Scanning</button>
     </div>
     <div class="gps-readout">
       <span id="gpsCoords">GPS: not locked</span>
@@ -442,13 +445,27 @@
   const placeholder = document.getElementById('scanPlaceholder');
   const btnCamera = document.getElementById('btnCamera');
   const btnCapture = document.getElementById('btnCapture');
+  const btnAuto = document.getElementById('btnAuto');
   const scanLine = document.getElementById('scanLine');
   const gpsCoords = document.getElementById('gpsCoords');
   const gpsAcc = document.getElementById('gpsAcc');
   const resultBanner = document.getElementById('resultBanner');
 
   let currentPos = null;
-  let watchId = null;
+  let autoTimer = null;
+  let isScanning = false;
+  const AUTO_INTERVAL_MS = 4000;   // one scan every 4s in live mode
+  const MAX_WIDTH = 640;           // downscale before upload — big speed win on free-tier CPU
+
+  async function wakeServer(){
+    resultBanner.textContent = 'Waking up detection engine (first request can take up to 60s on the free tier)…';
+    resultBanner.className = 'result-banner show warn';
+    try{
+      await fetch(`${API_BASE}/`);
+      document.getElementById('apiStatus').innerHTML = '<span class="dot"></span> API Live';
+      resultBanner.classList.remove('show');
+    }catch(e){ /* will retry on first real scan */ }
+  }
 
   btnCamera.addEventListener('click', async () => {
     try{
@@ -459,8 +476,11 @@
       btnCamera.textContent = 'Camera On';
       btnCamera.disabled = true;
       btnCapture.disabled = false;
+      btnAuto.disabled = false;
 
-      watchId = navigator.geolocation.watchPosition(pos => {
+      wakeServer();
+
+      navigator.geolocation.watchPosition(pos => {
         currentPos = pos.coords;
         gpsCoords.innerHTML = `GPS: <span>${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)}</span>`;
         gpsAcc.textContent = `±${Math.round(pos.coords.accuracy)}m`;
@@ -473,51 +493,82 @@
     }
   });
 
-  btnCapture.addEventListener('click', async () => {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
+  function captureBlob(){
+    const w = Math.min(MAX_WIDTH, video.videoWidth || MAX_WIDTH);
+    const h = Math.round((video.videoHeight / video.videoWidth) * w) || w;
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+    return new Promise(resolve => canvas.toBlob(b => resolve(b), 'image/jpeg', 0.7));
+  }
 
+  async function runScan(){
+    if(isScanning) return;
+    isScanning = true;
     scanLine.classList.add('active');
-    btnCapture.disabled = true;
-    btnCapture.textContent = 'Scanning…';
-    resultBanner.className = 'result-banner';
 
     const lat = currentPos ? currentPos.latitude : 31.5204;
     const lon = currentPos ? currentPos.longitude : 74.3587;
+    const blob = await captureBlob();
 
-    canvas.toBlob(async (blob) => {
-      const formData = new FormData();
-      formData.append('file', blob, 'scan.jpg');
-      formData.append('latitude', lat);
-      formData.append('longitude', lon);
+    const formData = new FormData();
+    formData.append('file', blob, 'scan.jpg');
+    formData.append('latitude', lat);
+    formData.append('longitude', lon);
 
-      try{
-        const res = await fetch(`${API_BASE}/detect`, { method: 'POST', body: formData });
-        const data = await res.json();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
 
-        if(data.potholes_detected > 0){
-          data.detections.forEach(d => { detections.push(d); addMarker(d); reverseGeocode(d); });
-          map.setView([lat, lon], 15);
-          resultBanner.textContent = `${data.potholes_detected} pothole(s) detected in this frame.`;
-          resultBanner.classList.add('show','ok');
-        } else {
-          resultBanner.textContent = 'No potholes detected in this frame — road looks clear.';
-          resultBanner.classList.add('show','warn');
-        }
-        renderLog();
-        updateStats();
-        document.getElementById('apiStatus').innerHTML = '<span class="dot"></span> API Live';
+    try{
+      const res = await fetch(`${API_BASE}/detect`, { method: 'POST', body: formData, signal: controller.signal });
+      clearTimeout(timeout);
+      const data = await res.json();
 
-      }catch(err){
-        resultBanner.textContent = 'Detection engine is waking up (free-tier cold start) — retry in ~30s.';
-        resultBanner.classList.add('show','warn');
+      if(data.potholes_detected > 0){
+        data.detections.forEach(d => { detections.push(d); addMarker(d); reverseGeocode(d); });
+        map.setView([lat, lon], 15);
+        resultBanner.textContent = `${data.potholes_detected} pothole(s) detected in this frame.`;
+        resultBanner.className = 'result-banner show ok';
+      } else {
+        resultBanner.textContent = 'No potholes detected in this frame — road looks clear.';
+        resultBanner.className = 'result-banner show warn';
       }
+      renderLog();
+      updateStats();
+      document.getElementById('apiStatus').innerHTML = '<span class="dot"></span> API Live';
 
-      scanLine.classList.remove('active');
-      btnCapture.disabled = false;
-      btnCapture.textContent = 'Scan for Potholes';
-    }, 'image/jpeg', 0.85);
+    }catch(err){
+      clearTimeout(timeout);
+      if(err.name === 'AbortError'){
+        resultBanner.textContent = 'Request timed out — server may still be waking up. Try again in a few seconds.';
+      } else {
+        resultBanner.textContent = 'Could not reach detection engine — check your connection and try again.';
+      }
+      resultBanner.className = 'result-banner show warn';
+    }
+
+    scanLine.classList.remove('active');
+    isScanning = false;
+  }
+
+  btnCapture.addEventListener('click', async () => {
+    btnCapture.disabled = true;
+    btnCapture.textContent = 'Scanning…';
+    await runScan();
+    btnCapture.disabled = false;
+    btnCapture.textContent = 'Scan Once';
+  });
+
+  btnAuto.addEventListener('click', () => {
+    if(autoTimer){
+      clearInterval(autoTimer);
+      autoTimer = null;
+      btnAuto.textContent = 'Start Live Scanning';
+      btnAuto.classList.remove('btn-primary');
+      return;
+    }
+    btnAuto.textContent = 'Stop Live Scanning';
+    runScan();
+    autoTimer = setInterval(runScan, AUTO_INTERVAL_MS);
   });
 </script>
 </body>
