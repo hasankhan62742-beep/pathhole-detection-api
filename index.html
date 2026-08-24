@@ -635,13 +635,13 @@
       clearTimeout(timeout);
       const data = await res.json();
 
-      if(data.potholes_detected > 0){
+      if(data.confirmed_potholes > 0){
         data.detections.forEach(d => { detections.push(d); addMarker(d); reverseGeocode(d); });
         map.setView([lat, lon], 15);
-        resultBanner.textContent = `${data.potholes_detected} pothole(s) detected in this frame.`;
+        resultBanner.textContent = `${data.confirmed_potholes} pothole(s) confirmed at this location.`;
         resultBanner.className = 'result-banner show ok';
       } else {
-        resultBanner.textContent = 'No potholes detected in this frame — road looks clear.';
+        resultBanner.textContent = 'Scanning… no pothole confirmed yet at this spot (needs a second look to confirm and rule out false positives).';
         resultBanner.className = 'result-banner show warn';
       }
       renderLog();
